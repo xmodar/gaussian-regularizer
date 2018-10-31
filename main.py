@@ -6,8 +6,12 @@ import tensorflow as tf
 from shutil import rmtree
 from functools import wraps
 from itertools import product
+from collections import namedtuple
 import network_moments.torch.gaussian as gnm
 from argparse import Namespace, ArgumentParser
+
+__all__ = ['LeNetGNM', 'LeNetGNMTrainer', 'Results', 'Tee',
+           'check_experiments', 'main']
 
 
 class LeNetGNM(gnm.net.LeNet):
@@ -106,12 +110,19 @@ class LeNetGNMTrainer(gnm.net.ClassifierTrainer):
                 os.remove(config.checkpoint)
 
     @classmethod
-    def experiment(cls, dataset, empirical, sigma, expectation,
-                   epochs=100, device='cuda'):
+    def experiment(cls, dataset, augmentation, empirical, sigma, expectation,
+                   epochs=100, device='cuda', run=False):
         # get the configurations of this experiment
-        config = cls.config(dataset, empirical, expectation,
+        config = cls.config(dataset, augmentation, empirical, expectation,
                             sigma, epochs, device)
-        if config is None or cls.finished(config):
+        if config is None:
+            return
+        finished = cls.finished(config)
+        if not run:
+            done = '[done]' if finished else '[todo]'
+            print(f'{done} {dataset}: {os.path.basename(config.log_dir)}')
+            return finished
+        elif finished:
             return
         cls.delete_experiment(config)
 
@@ -130,7 +141,8 @@ class LeNetGNMTrainer(gnm.net.ClassifierTrainer):
 
             # log the rebustness results into tensorboard
             if config.log_dir is not None:
-                value = lambda k, v: tf.Summary.Value(tag=k, simple_value=v)
+                def value(k, v):
+                    return tf.Summary.Value(tag=k, simple_value=v)
                 directory = os.path.join(config.log_dir, f'epoch_{epoch}')
                 writer = tf.summary.FileWriter(directory)
                 writer.add_summary(tf.Summary(value=[
@@ -167,6 +179,41 @@ class LeNetGNMTrainer(gnm.net.ClassifierTrainer):
         return state['epoch'], test_accuracy, robustness, plot
 
     @classmethod
+    def data_from_config(cls, config, train=False, model=None):
+        out = super().data_from_config(config, train=train, model=model)
+        folds = config.data.train.augmentation + 1
+        if not train or folds == 1:
+            return out
+        train_loader, valid_loader = out
+        original_len = train_loader.dataset.__len__()
+        len_dataset = original_len * folds
+        sigma = config.optimization.input_variance ** 0.5
+        seed = int(torch.randint(sys.maxsize - folds, tuple()))
+        original_getitem = train_loader.dataset.__getitem__
+
+        class Augmented(torch.utils.data.Dataset):
+            def __getitem__(self, index):
+                if not -len_dataset <= index < len_dataset:
+                    raise IndexError(f'{index} not in size {len_dataset}')
+                index = index % len_dataset
+                image, label = original_getitem(index % original_len)
+                offset = index // original_len
+                if offset == 0:
+                    return image, label
+                with gnm.utils.rand.RNG(seed + offset, devices=[image.device]):
+                    new_image = torch.randn_like(image).mul_(sigma).add_(image)
+                return new_image, label
+
+            def __len__(self):
+                return len_dataset
+
+        new_train_set = Augmented()
+        train_loader.dataset = new_train_set
+        train_loader.sampler.data_source = new_train_set
+
+        return train_loader, valid_loader
+
+    @classmethod
     def train_from_config(cls, config):
         ignore = config.optimization.loss_terms.ignore_zeros
         old_ignore = cls.ignore_zero_loss_coefficients
@@ -194,24 +241,31 @@ class LeNetGNMTrainer(gnm.net.ClassifierTrainer):
         return config
 
     @classmethod
-    def config(cls, dataset, empirical, sigma, expectation,
+    def config(cls, dataset, augmentation, empirical, sigma, expectation,
                epochs=100, device='cuda'):
         if (empirical == 0 and expectation != 1):
             return
         if expectation == 0 and empirical != 1:
             return
-        if (sigma == 0) != (expectation == 0):
+        if (sigma == 0) != (expectation == 0 and augmentation == 0):
             return
-        name = f'emp_{empirical:.4e}_sig_{sigma:.4e}_exp_{expectation:.4e}'
+        if augmentation != 0 and expectation != 0:
+            return
         config = cls.default_config()
-        cls.config_model_dataset(config, dataset=dataset)
         config.epochs = epochs
         config.device = device
-        config.log_dir = os.path.join(config.log_dir, name)
-        config.checkpoint = os.path.join(config.checkpoint[:-3], name + '.pt')
         config.optimization.input_variance = sigma ** 2
         config.optimization.loss_terms.empirical = empirical
         config.optimization.loss_terms.expectation = expectation
+        cls.config_model_dataset(config, dataset=dataset)
+        config.data.train.augmentation = augmentation
+        name = f'emp_{empirical:.4e}_sig_{sigma:.4e}'
+        if augmentation == 0:
+            name += f'_exp_{expectation:.4e}'
+        else:
+            name += f'_aug_{augmentation:03d}'
+        config.log_dir = os.path.join(config.log_dir, name)
+        config.checkpoint = os.path.join(config.checkpoint[:-3], name + '.pt')
         return config
 
 
@@ -258,6 +312,70 @@ class Tee:
                 sys.stderr = self.stderr.original_stream
 
 
+class Results:
+    scalar_summary = namedtuple('scalar_summary',
+                                ('value', 'step', 'time'))
+
+    @classmethod
+    def all_experiments(cls, root='exps'):
+        path = os.path.join(root, '*/lenet/poc/*')
+        return glob(path, recursive=True)
+
+    @classmethod
+    def events_files(cls, root):
+        out = glob(os.path.join(root, 'events*'))
+        epochs = [int(d[d.rfind('_') + 1:])
+                  for d in os.listdir(root) if d.startswith('epoch_')]
+        out += glob(os.path.join(root, f'epoch_{max(epochs)}', 'events*'))
+        return out
+
+    @classmethod
+    def split(cls, path):
+        chunks = []
+        while path:
+            path, name = os.path.split(path)
+            chunks.insert(0, name)
+        return chunks
+
+    @classmethod
+    def arguments(cls, experiment):
+        path, name = os.path.split(experiment)
+        exp = name.split('_')
+        out = {exp[2 * i]: float(exp[2 * i + 1]) for i in range(len(exp) // 2)}
+        if 'exp' not in out:
+            out['exp'] = 0
+        if 'aug' not in out:
+            out['aug'] = 0
+        out['aug'] = int(out['aug'])
+        out['dataset'] = cls.split(path)[-3]
+        return out
+
+    @classmethod
+    def parse_events_files(cls, experiment):
+        summaries = {}
+        for events_file in cls.events_files(experiment):
+            for event in tf.train.summary_iterator(events_file):
+                for value in event.summary.value:
+                    key = value.tag
+                    if key not in summaries:
+                        summaries[key] = []
+                    summary = cls.scalar_summary(
+                        value.simple_value, event.step, event.wall_time)
+                    summaries[key].append(summary)
+        return summaries
+
+    @classmethod
+    def all_results(cls, root='exps'):
+        for experiment in cls.all_experiments(root):
+            yield cls.results(experiment)
+
+    @classmethod
+    def results(cls, experiment):
+        out = cls.arguments(experiment)
+        out['summary'] = cls.parse_events_files(experiment)
+        return out
+
+
 def check_experiments():
     experiments = glob('exps/**/emp_*', recursive=True)
     finished = set(os.path.dirname(f)
@@ -286,27 +404,30 @@ def check_experiments():
                 print('.......................')
 
 
-def main(device_index, multiple_gpus=True):
+def main(run, device_index, multiple_gpus=True):
     datasets = ['mnist', 'cifar10', 'cifar100']
+    augs = [0, 1, 5, 10, 20]
     emps = [0, 1]
     exps = [0, 0.5, 1.0, 1.5, 2]
     sigmas = [0, 0.1, 0.2, 0.3, 0.5, 0.75, 1]
 
     count = torch.cuda.device_count()
-    experiments = list(product(datasets, emps, sigmas, exps))
-    for i, (dataset, emp, sigma, exp) in enumerate(experiments):
-        print(f'|#| Iteration {i + 1} out of {len(experiments)}...')
+    experiments = list(product(datasets, augs, emps, sigmas, exps))
+    for i, (dataset, aug, emp, sigma, exp) in enumerate(experiments):
+        # print(f'|#| Iteration {i + 1} out of {len(experiments)}...')
         if multiple_gpus and i % count != device_index:
             continue
         try:
-            LeNetGNMTrainer.experiment(dataset, emp, sigma, exp,
-                                       device=f'cuda:{device_index}')
+            LeNetGNMTrainer.experiment(dataset, aug, emp, sigma, exp,
+                                       device=f'cuda:{device_index}', run=run)
         except Exception as exc:
-            print(f'\n{str(exc)}')
+            print(f'\n{str(exc.traceback)}')
 
 
 if __name__ == '__main__':
     parser = ArgumentParser(description='PoC: Training with expectation.')
+    parser.add_argument('-r', '--run', default=False, action='store_true',
+                        help='Whether to run the experiments or print them.')
     parser.add_argument('-c', '--check', default=False,
                         action='store_true',
                         help='Check all run experiments.')
