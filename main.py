@@ -3,35 +3,37 @@ from itertools import product, repeat
 from pathlib import Path
 from pprint import pprint
 
+from evaluate import get_robustness
 from experiments import GaussianExp
 
 if __name__ == '__main__':
     methods = {
-        'nominal':
-            dict(sigma=[0.0], alpha=[0.0], gamma=[0.0]),
-        'cohen':
+        'consistency':
             dict(
-                sigma=[0.12, 0.25, 0.5, 1.0],
-                alpha=[0.0],  # no moment training
-                gamma=[1.0],  # only noisy input
+                moment_loss=['consistency'],
+                sigma=[0.12, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0],
+                alpha=[1.0, 0.75, 0.5, 0.25],
+                gamma=[0.5],
             ),
-        'augment':
+        'cross_entropy_outputs':
             dict(
-                sigma=[0.12, 0.25, 0.5, 1.0],
-                alpha=[0.0],  # no moment training
-                gamma=[0.5],  # sometimes augment
+                moment_loss=['cross_entropy_outputs'],
+                sigma=[0.12, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0],
+                alpha=[1.0, 0.75, 0.5, 0.25],
+                gamma=[0.5],
             ),
-        'ours':
+        'cross_entropy':
             dict(
-                sigma=[0.12, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0],
-                alpha=[1.0, 0.9, 0.75, 0.5, 0.25, 0.12],
-                gamma=[0.0],  # only clean input
+                moment_loss=['cross_entropy'],
+                sigma=[0.12, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0],
+                alpha=[1.0, 0.75, 0.5, 0.25],
+                gamma=[0.5],
             ),
     }
 
     experiments = []
-    root_path = Path('./results')
-    models = ['alexnet', 'vgg16_bn', 'resnet8', 'resnet56', 'resnet110']
+    root_path = Path('./fixes')
+    models = ['resnet56']
     for name, method in methods.items():
         keys = repeat(('name', 'model') + tuple(method.keys()))
         values = product([name], models, *method.values())
@@ -47,6 +49,7 @@ if __name__ == '__main__':
         gaussian_exp = GaussianExp(**vars(config))
         pprint(gaussian_exp.config)
         gaussian_exp.train()
+        get_robustness(gaussian_exp.config['path'])
     else:
         pprint(experiments)
         print(f'Total number of experiments: {len(experiments)}')

@@ -9,7 +9,7 @@ import torch
 from tqdm import tqdm
 
 from experiments import GaussianExp
-# from smoothing.code.analyze import  plot_certified_accuracy
+# from smoothing.code.analyze import plot_certified_accuracy
 from smoothing.code.analyze import ApproximateAccuracy, Line
 
 

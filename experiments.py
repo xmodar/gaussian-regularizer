@@ -283,6 +283,8 @@ class Experiment:
         if self.epoch >= self.config['epochs']:
             return
         with self.train_logger(self.config['log']) as logger:
+            if logger is not None:
+                self.config['path'] = str(Path(logger.log_dir).absolute())
             best = self.train_stopping()  # initialize
             for _ in range(self.epoch, self.config['epochs']):
                 metrics = self.step()
@@ -417,6 +419,8 @@ class GaussianExp(CIFAR10Exp):
     @staticmethod
     def arg_parser(*args, **kwargs):
         p = CIFAR10Exp.arg_parser(*args, **kwargs)
+        loss = ['cross_entropy', 'cross_entropy_outputs', 'consistency']
+        p.add_argument('--moment-loss', choices=loss, default='cross_entropy')
         p.add_argument('--sigma', type=float, default=0, help='noise level')
         p.add_argument('--gamma', type=float, default=0, help='augmentation')
         p.add_argument('--alpha', type=float, default=0, help='trade-off')
@@ -498,13 +502,20 @@ class GaussianExp(CIFAR10Exp):
         return mu_forward, forward
 
     def step_outputs(self, batch, train):
-        if self.config['alpha'] == 0:
-            return super().step_outputs(batch, train)
-
-        mu_logits, logits = self.gaussian_forward(batch, train)
-        moment_loss = F.cross_entropy(mu_logits, batch['targets'])
-        empirical_loss = F.cross_entropy(logits, batch['targets'])
         a = self.config['alpha']
+        if a == 0:
+            return super().step_outputs(batch, train)
+        mu_logits, logits = self.gaussian_forward(batch, train)
+        empirical_loss = F.cross_entropy(logits, batch['targets'])
+        loss_type = self.config['moment_loss']
+        if loss_type == 'cross_entropy':
+            moment_loss = F.cross_entropy(mu_logits, batch['targets'])
+        elif loss_type == 'cross_entropy_outputs':
+            moment_loss = F.cross_entropy(mu_logits, logits.argmax(1))
+        elif loss_type == 'consistency':
+            moment_loss = F.mse_loss(mu_logits, logits.detach())
+        else:
+            raise ValueError(f'Unknown moment loss type: {loss_type}')
         loss = (1 - a) * empirical_loss + a * moment_loss
 
         if train:
