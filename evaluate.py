@@ -184,7 +184,7 @@ def get_title(path):
 
 def get_all_results(root_path):
     results = defaultdict(list)
-    for path in sorted(Path(root_path).glob('**/state_dict.pt')):
+    for path in sorted(Path(root_path).glob('**/config.json')):
         path = path.parent
         config = get_config(path)
         sigma = config['sigma']
@@ -198,8 +198,8 @@ def get_all_results(root_path):
         results['accuracy'] += [metrics['accuracy']]
         results['moment_accuracy'] += [metrics.get('moment_accuracy')]
         results['robustness'] += [get_robustness(path)['AuC']]
-        results['sigma_robustness'] += [get_sigma_robustness(path)]
-        results['sigma_certificates'] += [get_sigma_certificates(path)]
+        # results['sigma_robustness'] += [get_sigma_robustness(path)]
+        # results['sigma_certificates'] += [get_sigma_certificates(path)]
         results['path'] += [path]
     return pd.DataFrame(results)
 
