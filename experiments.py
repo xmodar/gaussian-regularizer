@@ -180,9 +180,9 @@ class Experiment:
 
     def step_scheduler(self, metrics):
         if isinstance(self.scheduler, lr_scheduler.ReduceLROnPlateau):
-            self.scheduler.step(self.train_stopping_value(metrics), self.epoch)
+            self.scheduler.step(self.train_stopping_value(metrics))
         elif self.scheduler is not None:
-            self.scheduler.step(self.epoch)
+            self.scheduler.step()
 
     def step_metrics(self, metrics=None, batch=None, outputs=None):
         if not metrics:  # initialize
@@ -419,7 +419,7 @@ class GaussianExp(CIFAR10Exp):
     @staticmethod
     def arg_parser(*args, **kwargs):
         p = CIFAR10Exp.arg_parser(*args, **kwargs)
-        loss = ['cross_entropy', 'cross_entropy_outputs', 'consistency']
+        loss = ['cross_entropy', 'mse_loss']
         p.add_argument('--moment-loss', choices=loss, default='cross_entropy')
         p.add_argument('--sigma', type=float, default=0, help='noise level')
         p.add_argument('--gamma', type=float, default=0, help='augmentation')
@@ -430,8 +430,17 @@ class GaussianExp(CIFAR10Exp):
         model = super().init_model()
         assert isinstance(model, nn.Sequential)
         assert isinstance(model[0], nn.Conv2d)
+
+        # i = 0
+        # while i < len(model):
+        #     if isinstance(model[i], nn.BatchNorm2d):
+        #         del model[i]
+        #     else:
+        #         i += 1
+
         if isinstance(model[1], nn.BatchNorm2d):
             assert isinstance(model[2], nn.ReLU)
+            # del model[1]
         else:
             assert isinstance(model[1], nn.ReLU)
         return model
@@ -439,7 +448,7 @@ class GaussianExp(CIFAR10Exp):
     @property
     def sigma(self):
         std = self.data['train'].dataset.transform.transforms[-1].std
-        std = torch.tensor(std, dtype=torch.float32, device=self.device)
+        std = torch.as_tensor(std, dtype=torch.float32, device=self.device)
         return float(self.config['sigma']) / std.view(-1, 1, 1)
 
     def step_batch(self, batch):
@@ -454,22 +463,30 @@ class GaussianExp(CIFAR10Exp):
 
     @staticmethod
     def conv2d_var_mean(conv, var, mu):
-        # var = F.conv2d(torch.ones_like(mu) * var, conv.weight**2, pad...)
-        # for efficiency, we will approximate this by assuming no padding
-        # only border activations will be erroneous which is not that bad
-        w = conv.weight
-        var = (w * w * var).flatten(1).sum(1).view(-1, 1, 1)
+        assert isinstance(conv, nn.Conv2d)
+        assert mu.ndim == var.ndim + 1 == 4
+        if conv.padding == (0, 0):
+            var = (conv.weight.pow(2) * var).flatten(1).sum(1).view(-1, 1, 1)
+        else:
+            try:
+                bias, conv.bias = conv.bias, None
+                var = var.expand(1, *mu.shape[1:])
+                # pylint: disable=protected-access
+                var = conv._conv_forward(var, conv.weight.pow(2)).squeeze(0)
+            finally:
+                conv.bias = bias
         return var, conv(mu)
 
     @staticmethod
-    def batch_norm_var_mean(bn, var, mu):
-        if bn.track_running_stats:
+    def batchnorm2d_var_mean(bn, var, mu):
+        assert isinstance(bn, nn.BatchNorm2d)
+        w_square = bn.weight.pow(2).view(-1, 1, 1) if bn.affine else 1
+        # if not bn.training and bn.track_running_stats:
+        if bn.track_running_stats:  # compute bn moments as if in eval mode
             r_var = bn.running_var
         else:
-            r_var = mu.transpose(1, 0).flatten(1).var(1, unbiased=False)
-        var = var / (r_var.view(-1, 1, 1) + bn.eps)
-        if bn.affine:
-            var = var * (bn.weight * bn.weight).view(-1, 1, 1)
+            r_var = mu.transpose(0, 1).flatten(1).var(1, unbiased=False)
+        var = var * (w_square / (r_var.view(-1, 1, 1) + bn.eps))
         return var, bn(mu)
 
     @staticmethod
@@ -480,16 +497,25 @@ class GaussianExp(CIFAR10Exp):
         return mu * cdf + std * pdf
 
     def gaussian_forward(self, batch, train):
-        var, mu = self.sigma * self.sigma, batch['inputs']
+        var, mu = self.sigma.pow(2), batch['inputs']
         var, mu = self.conv2d_var_mean(self.model[0], var, mu)
 
         i = 1
         if isinstance(self.model[i], nn.BatchNorm2d):
-            var, mu = self.batch_norm_var_mean(self.model[i], var, mu)
+            var, mu = self.batchnorm2d_var_mean(self.model[i], var, mu)
             i += 1
 
+        mu_relu = self.relu_mean(var.sqrt(), mu)
         rest = self.model[i + 1:]
-        mu_forward = rest(self.relu_mean(var.sqrt(), mu))
+        if train:
+            rest.eval()
+        mu_forward = rest(mu_relu)
+        # _, mu_forward = torch.autograd.functional.jvp(self.model[i + 1:],
+        #                                               mu.clamp(min=0),
+        #                                               mu_relu,
+        #                                               create_graph=train)
+        if train:
+            rest.train()
 
         if train and self.config['alpha'] == 1:
             with torch.no_grad():
@@ -509,10 +535,8 @@ class GaussianExp(CIFAR10Exp):
         empirical_loss = F.cross_entropy(logits, batch['targets'])
         loss_type = self.config['moment_loss']
         if loss_type == 'cross_entropy':
-            moment_loss = F.cross_entropy(mu_logits, batch['targets'])
-        elif loss_type == 'cross_entropy_outputs':
             moment_loss = F.cross_entropy(mu_logits, logits.argmax(1))
-        elif loss_type == 'consistency':
+        elif loss_type == 'mse_loss':
             moment_loss = F.mse_loss(mu_logits, logits.detach())
         else:
             raise ValueError(f'Unknown moment loss type: {loss_type}')

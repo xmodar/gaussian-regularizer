@@ -8,20 +8,6 @@ from experiments import GaussianExp
 
 if __name__ == '__main__':
     methods = {
-        'consistency':
-            dict(
-                moment_loss=['consistency'],
-                sigma=[0.12, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0],
-                alpha=[1.0, 0.75, 0.5, 0.25],
-                gamma=[0.5],
-            ),
-        'cross_entropy_outputs':
-            dict(
-                moment_loss=['cross_entropy_outputs'],
-                sigma=[0.12, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0],
-                alpha=[1.0, 0.75, 0.5, 0.25],
-                gamma=[0.5],
-            ),
         'cross_entropy':
             dict(
                 moment_loss=['cross_entropy'],
@@ -32,7 +18,7 @@ if __name__ == '__main__':
     }
 
     experiments = []
-    root_path = Path('./fixes')
+    root_path = Path('./results')
     models = ['resnet56']
     for name, method in methods.items():
         keys = repeat(('name', 'model') + tuple(method.keys()))
